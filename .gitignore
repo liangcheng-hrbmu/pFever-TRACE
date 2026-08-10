@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+renv/library/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local data and generated outputs
+data/*
+!data/README.md
+outputs/*
+!outputs/README.md
+results/
+figures/
+logs/
+
+# Large analysis artifacts
+*.h5ad
+*.h5seurat
+*.loom
+*.rds
+*.RDS
+*.mtx
+*.mtx.gz
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.ckpt
+
+# Local credentials and environment files
+.env
+.env.*
+*.pem
+*.key
+
+# Codex working files
+.codex*

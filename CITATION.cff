@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the accompanying manuscript."
+title: "pFever-TRACE: a circulating immune cell atlas for pediatric febrile disease classification"
+type: software
+authors:
+  - family-names: Liu
+    given-names: Xingwang
+  - family-names: Cheng
+    given-names: Liang
+    email: liangcheng@hrbmu.edu.cn
+date-released: 2026-08-09
+keywords:
+  - pediatric fever
+  - single-cell RNA sequencing
+  - PBMC atlas
+  - explainable machine learning
+  - transcriptomics
