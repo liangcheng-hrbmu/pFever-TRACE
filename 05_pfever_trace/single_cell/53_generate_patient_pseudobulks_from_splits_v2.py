@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os
-import re
 import pickle
 import argparse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -87,54 +86,186 @@ def aggregate_embedding_to_pseudobulk(
     return adata_pb
 
 
-def get_embedding_matrix(
-    adata,
-    obs_sub: pd.DataFrame,
-    embedding_obsm: Optional[str],
-    scanvi_model_dir: Optional[str],
-) -> np.ndarray:
-    if embedding_obsm is not None and embedding_obsm != "NONE" and embedding_obsm in adata.obsm.keys():
-        idx = adata.obs_names.get_indexer(obs_sub.index)
-        X = adata.obsm[embedding_obsm][idx]
-        return np.asarray(X, dtype=np.float32)
+def require_complete_obs(adata: ad.AnnData, columns: Sequence[str], context: str) -> None:
+    for col in columns:
+        missing = int(adata.obs[col].isna().sum())
+        if missing:
+            raise ValueError(f"{context}: obs[{col!r}] contains {missing} missing values.")
 
-    if scanvi_model_dir is None:
-        raise ValueError(
-            f"embedding_obsm={embedding_obsm} not found in adata.obsm and no --scanvi_model_dir provided."
-        )
+
+def one_hot_encode_covariates(
+    adata: ad.AnnData,
+    covariate_keys: Sequence[str],
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    encoded_keys: List[str] = []
+    encoding_map: Dict[str, List[str]] = {}
+
+    for key in covariate_keys:
+        missing = int(adata.obs[key].isna().sum())
+        if missing:
+            raise ValueError(f"obs[{key!r}] contains {missing} missing values.")
+
+        values = adata.obs[key].astype(str)
+        categories = sorted(pd.unique(values).tolist())
+        output_keys = []
+        for category_id, category in enumerate(categories):
+            output_key = f"__covariate_{key}_{category_id}"
+            adata.obs[output_key] = (values == category).astype(np.float32)
+            encoded_keys.append(output_key)
+            output_keys.append(output_key)
+        encoding_map[key] = output_keys
+
+    return encoded_keys, encoding_map
+
+
+def prepare_reference_and_query_obs(
+    adata_ref: ad.AnnData,
+    adata_query: ad.AnnData,
+    labels_key: str,
+    batch_key: str,
+    categorical_covariate_keys: Sequence[str],
+    continuous_covariate_keys: Sequence[str],
+    unlabeled_category: str,
+) -> None:
+    categorical_keys = [batch_key, *categorical_covariate_keys]
+    require_complete_obs(adata_ref, [labels_key, *categorical_keys], "reference")
+    require_complete_obs(adata_query, categorical_keys, "query")
+    require_complete_obs(adata_ref, continuous_covariate_keys, "reference")
+    require_complete_obs(adata_query, continuous_covariate_keys, "query")
+
+    reference_labels = pd.Categorical(adata_ref.obs[labels_key].astype(str))
+    if unlabeled_category not in reference_labels.categories:
+        reference_labels = reference_labels.add_categories([unlabeled_category])
+    adata_ref.obs[labels_key] = reference_labels
+
+    query_label_categories = list(reference_labels.categories)
+    adata_query.obs[labels_key] = pd.Categorical(
+        [unlabeled_category] * adata_query.n_obs,
+        categories=query_label_categories,
+    )
+
+    for key in categorical_keys:
+        adata_ref.obs[key] = adata_ref.obs[key].astype(str).astype("category")
+        adata_query.obs[key] = adata_query.obs[key].astype(str).astype("category")
+
+    for key in continuous_covariate_keys:
+        adata_ref.obs[key] = pd.to_numeric(adata_ref.obs[key], errors="raise")
+        adata_query.obs[key] = pd.to_numeric(adata_query.obs[key], errors="raise")
+
+
+def train_and_map_fold_scanvi(
+    adata_ref: ad.AnnData,
+    adata_query: ad.AnnData,
+    counts_layer: Optional[str],
+    labels_key: str,
+    batch_key: str,
+    categorical_covariate_keys: Sequence[str],
+    continuous_covariate_keys: Sequence[str],
+    unlabeled_category: str,
+    n_latent: int,
+    max_epochs_scvi: int,
+    max_epochs_scanvi: int,
+    max_epochs_query: int,
+    seed: int,
+    model_dir: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, str]]:
     if scvi is None:
-        raise ImportError("scvi-tools is required when embedding_obsm is unavailable.")
+        raise ImportError("scvi-tools is required for fold-specific scVI/scANVI fitting.")
 
-    adata_sub = adata[obs_sub.index].copy()
+    prepare_reference_and_query_obs(
+        adata_ref=adata_ref,
+        adata_query=adata_query,
+        labels_key=labels_key,
+        batch_key=batch_key,
+        categorical_covariate_keys=categorical_covariate_keys,
+        continuous_covariate_keys=continuous_covariate_keys,
+        unlabeled_category=unlabeled_category,
+    )
 
-    model = None
-    try:
-        model = scvi.model.SCANVI.load(scanvi_model_dir, adata=adata)
-    except Exception:
-        try:
-            model = scvi.model.SCVI.load(scanvi_model_dir, adata=adata)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load scANVI/SCVI model from {scanvi_model_dir}: {e}")
+    scvi.settings.seed = seed
+    scvi.model.SCVI.setup_anndata(
+        adata_ref,
+        layer=counts_layer,
+        batch_key=batch_key,
+        labels_key=labels_key,
+        categorical_covariate_keys=list(categorical_covariate_keys) or None,
+        continuous_covariate_keys=list(continuous_covariate_keys) or None,
+    )
 
-    latent = model.get_latent_representation(adata=adata_sub)
-    return np.asarray(latent, dtype=np.float32)
+    reference_scvi = scvi.model.SCVI(adata_ref, n_latent=n_latent)
+    reference_scvi.train(max_epochs=max_epochs_scvi)
+
+    reference_scanvi = scvi.model.SCANVI.from_scvi_model(
+        reference_scvi,
+        unlabeled_category=unlabeled_category,
+    )
+    reference_scanvi.train(max_epochs=max_epochs_scanvi)
+
+    reference_latent = np.asarray(
+        reference_scanvi.get_latent_representation(),
+        dtype=np.float32,
+    )
+
+    scvi.model.SCANVI.prepare_query_anndata(adata_query, reference_scanvi)
+    query_scanvi = scvi.model.SCANVI.load_query_data(adata_query, reference_scanvi)
+    query_scanvi.train(
+        max_epochs=max_epochs_query,
+        plan_kwargs={"weight_decay": 0.0},
+    )
+
+    query_latent = np.asarray(
+        query_scanvi.get_latent_representation(),
+        dtype=np.float32,
+    )
+    query_level1 = np.asarray(query_scanvi.predict(), dtype=str)
+
+    model_paths: Dict[str, str] = {}
+    if model_dir is not None:
+        ensure_dir(model_dir)
+        model_paths = {
+            "reference_scvi_model": os.path.join(model_dir, "reference_scvi"),
+            "reference_scanvi_model": os.path.join(model_dir, "reference_scanvi"),
+            "query_scanvi_model": os.path.join(model_dir, "query_scanvi"),
+        }
+        reference_scvi.save(model_paths["reference_scvi_model"], overwrite=True)
+        reference_scanvi.save(model_paths["reference_scanvi_model"], overwrite=True)
+        query_scanvi.save(model_paths["query_scanvi_model"], overwrite=True)
+
+    return reference_latent, query_latent, query_level1, model_paths
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Generate reference/query patient pseudobulk embeddings from split cell IDs (NaN-safe version)."
+        description=(
+            "Fit fold-specific scVI/scANVI references, map held-out cells as unlabeled queries, "
+            "and generate reference/query patient pseudobulk embeddings."
+        )
     )
     ap.add_argument("--in_h5ad", required=True)
     ap.add_argument("--kfold_pkl", required=True)
     ap.add_argument("--out_dir", required=True)
 
-    ap.add_argument("--embedding_obsm", default="X_scANVI")
-    ap.add_argument("--scanvi_model_dir", default=None)
     ap.add_argument("--level1_key", default="aifi_L1_paper")
-    ap.add_argument("--query_level1_key", default=None)
     ap.add_argument("--disease_key", default="disease_Level_3")
     ap.add_argument("--sample_key", default="sample_id")
     ap.add_argument("--patient_key", default="patient_id")
+    ap.add_argument("--counts_layer", default="counts",
+                    help="Raw-count layer used to fit fold-specific scVI models; use NONE for adata.X")
+    ap.add_argument("--batch_key", default="dataset_id")
+    ap.add_argument("--categorical_covariate_keys", nargs="*", default=["sex", "binned_age"])
+    ap.add_argument("--continuous_covariate_keys", nargs="*", default=[])
+    ap.add_argument("--unlabeled_category", default="Unknown")
+    ap.add_argument("--n_latent", type=int, default=30)
+    ap.add_argument("--max_epochs_scvi", type=int, default=200)
+    ap.add_argument("--max_epochs_scanvi", type=int, default=50)
+    ap.add_argument("--max_epochs_query", type=int, default=100)
+    ap.add_argument("--seed", type=int, default=5)
+    ap.add_argument(
+        "--save_models",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save the fold-specific reference and query models (default: false)",
+    )
     ap.add_argument("--exclude_level1", nargs="*", default=["RBC", "Platelets", "Cycling cells", "Progenitors"])
     ap.add_argument("--kfold_metadata_json", default=None)
     args = ap.parse_args()
@@ -143,17 +274,23 @@ def main():
     ensure_dir(os.path.join(args.out_dir, "reference"))
     ensure_dir(os.path.join(args.out_dir, "query"))
     ensure_dir(os.path.join(args.out_dir, "PSEUDOBULKs"))
-
-    q_level1_key = args.query_level1_key if args.query_level1_key else args.level1_key
+    if args.save_models:
+        ensure_dir(os.path.join(args.out_dir, "models"))
 
     print("[READ]", args.in_h5ad)
     adata = sc.read_h5ad(args.in_h5ad)
 
-    need_cols = [args.level1_key, args.disease_key, args.sample_key]
-    if q_level1_key not in need_cols:
-        need_cols.append(q_level1_key)
+    need_cols = [
+        args.level1_key,
+        args.disease_key,
+        args.sample_key,
+        args.batch_key,
+        *args.categorical_covariate_keys,
+        *args.continuous_covariate_keys,
+    ]
     if args.patient_key is not None:
         need_cols.append(args.patient_key)
+    need_cols = list(dict.fromkeys(need_cols))
 
     miss = [c for c in need_cols if c not in adata.obs.columns]
     if miss:
@@ -164,10 +301,22 @@ def main():
         obs[c] = obs[c].map(clean_str)
     adata.obs = obs
 
-    keep = ~adata.obs[args.level1_key].isin(args.exclude_level1)
-    if q_level1_key != args.level1_key:
-        keep &= ~adata.obs[q_level1_key].isin(args.exclude_level1)
-    adata = adata[keep].copy()
+    counts_layer = None if str(args.counts_layer).upper() == "NONE" else args.counts_layer
+    if counts_layer is not None and counts_layer not in adata.layers:
+        raise ValueError(f"adata.layers missing counts layer: {counts_layer}")
+
+    # scvi-tools 1.1.2 scArches cannot map queries with extra categorical
+    # covariates, so encode them as fixed numeric inputs before splitting.
+    encoded_covariate_keys, covariate_encoding_map = one_hot_encode_covariates(
+        adata,
+        args.categorical_covariate_keys,
+    )
+    model_continuous_covariate_keys = [
+        *args.continuous_covariate_keys,
+        *encoded_covariate_keys,
+    ]
+    if covariate_encoding_map:
+        print("[INFO] one-hot encoded categorical covariates:", covariate_encoding_map)
 
     benchmark_status_map = None
     if args.kfold_metadata_json is not None and os.path.exists(args.kfold_metadata_json):
@@ -196,13 +345,51 @@ def main():
         adataR = adata[ref_mask].copy()
         adataQ = adata[qry_mask].copy()
 
+        if adataR.n_obs == 0 or adataQ.n_obs == 0:
+            raise RuntimeError(
+                f"split={split_id}: empty reference/query after matching cell IDs "
+                f"(reference={adataR.n_obs}, query={adataQ.n_obs})."
+            )
+        if adataR.obs_names.intersection(adataQ.obs_names).size:
+            raise RuntimeError(f"split={split_id}: overlapping reference/query cells detected.")
+
+        model_dir = (
+            os.path.join(args.out_dir, "models", f"SPLIT_{split_id}")
+            if args.save_models else None
+        )
+        ZR, ZQ, query_level1, model_paths = train_and_map_fold_scanvi(
+            adata_ref=adataR,
+            adata_query=adataQ,
+            counts_layer=counts_layer,
+            labels_key=args.level1_key,
+            batch_key=args.batch_key,
+            categorical_covariate_keys=[],
+            continuous_covariate_keys=model_continuous_covariate_keys,
+            unlabeled_category=args.unlabeled_category,
+            n_latent=args.n_latent,
+            max_epochs_scvi=args.max_epochs_scvi,
+            max_epochs_scanvi=args.max_epochs_scanvi,
+            max_epochs_query=args.max_epochs_query,
+            seed=args.seed + split_id,
+            model_dir=model_dir,
+        )
+
+        adataQ.obs["scanvi_predicted_level1"] = query_level1
+
+        ref_core_mask = ~adataR.obs[args.level1_key].isin(args.exclude_level1).values
+        qry_core_mask = ~adataQ.obs["scanvi_predicted_level1"].isin(args.exclude_level1).values
+        adataR = adataR[ref_core_mask].copy()
+        adataQ = adataQ[qry_core_mask].copy()
+        ZR = ZR[ref_core_mask]
+        ZQ = ZQ[qry_core_mask]
+
+        adataR.obsm["X_fold_scANVI"] = ZR
+        adataQ.obsm["X_fold_scANVI"] = ZQ
+
         ref_fp = os.path.join(args.out_dir, "reference", f"scANVI_SPLIT_{split_id}_reference.h5ad")
         qry_fp = os.path.join(args.out_dir, "query", f"scANVI_SPLIT_{split_id}_query.h5ad")
         adataR.write(ref_fp, compression="gzip")
         adataQ.write(qry_fp, compression="gzip")
-
-        ZR = get_embedding_matrix(adata, adataR.obs.copy(), args.embedding_obsm, args.scanvi_model_dir)
-        ZQ = get_embedding_matrix(adata, adataQ.obs.copy(), args.embedding_obsm, args.scanvi_model_dir)
 
         adataPB_R = aggregate_embedding_to_pseudobulk(
             emb=ZR,
@@ -213,7 +400,7 @@ def main():
             benchmark_status_map=benchmark_status_map,
         )
 
-        q_obs = adataQ.obs.copy().rename(columns={q_level1_key: "__query_level1__"})
+        q_obs = adataQ.obs.copy().rename(columns={"scanvi_predicted_level1": "__query_level1__"})
         adataPB_Q = aggregate_embedding_to_pseudobulk(
             emb=ZQ,
             obs=q_obs,
@@ -253,6 +440,9 @@ def main():
             "query_level1": ";".join(sorted(pd.unique(adataPB_Q.obs["Level1"]).tolist())),
             "reference_fp": ref_pb_fp,
             "query_fp": qry_pb_fp,
+            "reference_scvi_model": model_paths.get("reference_scvi_model", ""),
+            "reference_scanvi_model": model_paths.get("reference_scanvi_model", ""),
+            "query_scanvi_model": model_paths.get("query_scanvi_model", ""),
         })
 
         print(f"[OK] split={split_id} | ref_pb={adataPB_R.shape} | qry_pb={adataPB_Q.shape}")
