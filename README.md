@@ -4,8 +4,6 @@ Code accompanying the manuscript **"A circulating immune cell atlas enables inte
 
 The study integrates single-cell and bulk RNA-sequencing data from 729 pediatric participants across 20 disease conditions and healthy controls. The single-cell atlas contains 617,936 peripheral blood mononuclear cells organized into 11 broad immune compartments and 52 fine cell states. The repository follows the order of the manuscript results, from atlas construction through external validation of pFever-TRACE.
 
-![Graphical abstract of the pediatric febrile disease immune atlas and pFever-TRACE workflow](graphical_abstract.png)
-
 > This repository contains analysis code. Controlled input data, intermediate objects, trained models, and generated figures are not committed. See [Data and local paths](#data-and-local-paths) and [Reproducibility notes](REPRODUCIBILITY.md) before running the workflow.
 
 ## Repository structure
